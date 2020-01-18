@@ -1,0 +1,8 @@
+{
+  "domain": "ccs811",
+  "name": "CCS811",
+  "documentation": "https://www.home-assistant.io/integrations/ccs811",
+  "requirements": ["adafruit-circuitpython-ccs811>=1.1.6"],
+  "dependencies": [],
+  "codeowners": []
+}

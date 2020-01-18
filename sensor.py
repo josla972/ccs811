@@ -1,6 +1,7 @@
 """Support for CCS811 temperature and humidity sensor."""
 from datetime import timedelta
 from functools import partial
+import asyncio
 import logging
 import sys
 import os
@@ -12,11 +13,15 @@ import adafruit_ccs811 # pylint: disable=import-error
 
 import voluptuous as vol
 
+from homeassistant.core import DOMAIN as HA_DOMAIN, callback
 from homeassistant.components.sensor import PLATFORM_SCHEMA
 import homeassistant.helpers.config_validation as cv
-from homeassistant.const import CONF_NAME, CONF_MONITORED_CONDITIONS
+from homeassistant.const import CONF_NAME, CONF_MONITORED_CONDITIONS, EVENT_HOMEASSISTANT_START, STATE_UNKNOWN
 from homeassistant.helpers.entity import Entity
 from homeassistant.util import Throttle
+from homeassistant.helpers.event import (
+    async_track_state_change,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -32,6 +37,9 @@ DEFAULT_I2C_SDA = 2
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(seconds=3)
 
+CONF_HUMIDITY_SENSOR = 'humidity_sensor'
+CONF_TEMPERATURE_SENSOR = 'temperature_sensor'
+
 SENSOR_ECO2 = "eco2"
 SENSOR_TVOC = "tvoc"
 SENSOR_TYPES = {
@@ -42,6 +50,8 @@ DEFAULT_MONITORED = [SENSOR_ECO2, SENSOR_TVOC]
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
+        vol.Optional(CONF_HUMIDITY_SENSOR, default=None): vol.Coerce(cv.entity_id),
+        vol.Optional(CONF_TEMPERATURE_SENSOR, default=None): vol.Coerce(cv.entity_id),
         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
         vol.Optional(CONF_I2C_ADDRESS, default=DEFAULT_I2C_ADDRESS): vol.Coerce(int),
         vol.Optional(CONF_MONITORED_CONDITIONS, default=DEFAULT_MONITORED): vol.All(
@@ -57,6 +67,8 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     name = config.get(CONF_NAME)
     i2c_address = config.get(CONF_I2C_ADDRESS)
     i2c_bus = busio.I2C(config.get(CONF_I2C_SCL), config.get(CONF_I2C_SDA))
+    temperature_sensor_entity_id = config.get(CONF_TEMPERATURE_SENSOR)
+    humidity_sensor_entity_id = config.get(CONF_HUMIDITY_SENSOR)
 
     sensor = await hass.async_add_job(
         partial(
@@ -72,7 +84,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     try:
         for variable in config[CONF_MONITORED_CONDITIONS]:
             dev.append(
-                CCS811Sensor(sensor_handler, variable, name)
+                CCS811Sensor(sensor_handler, variable, name, temperature_sensor_entity_id, humidity_sensor_entity_id)
             )
     except KeyError:
         pass
@@ -86,30 +98,95 @@ class CCS811Handler:
     def __init__(self, sensor):
         """Initialize the sensor handler."""
         self.sensor = sensor
+        self.temperature = None
+        self.humitidy = None
         self.update()
 
     @Throttle(MIN_TIME_BETWEEN_UPDATES)
     def update(self):
-        """Read sensor data."""
-
-# TODO:
-#        temperature = get_temperature()
-#        humidity = get_humidity()
-        # self.sensor.set_environmental_data(humidity, temperature):
+        """Update temperature and humidity compensation and read sensor data."""
+        if self.temperature != None and self.humidity != None:
+            self.sensor.set_environmental_data(self.humidity, self.temperature)
         self.eco2 = self.sensor.eco2
         self.tvoc = self.sensor.tvoc
+
+    def set_temperature(self, temperature):
+        """Set new target temperature."""
+        self.temperature = temperature
+
+    def set_humidity(self, humidity):
+        """Set new target humidity."""
+        self.humidity = humidity
 
 class CCS811Sensor(Entity):
     """Implementation of the CCS811 sensor."""
 
-    def __init__(self, ccs811_client, sensor_type, name):
+    def __init__(self, ccs811_client, sensor_type, name, temperature_sensor_entity_id, humidity_sensor_entity_id):
         """Initialize the sensor."""
         self.client_name = name
+        self.temperature_sensor_entity_id = temperature_sensor_entity_id
+        self.humidity_sensor_entity_id = humidity_sensor_entity_id
         self._name = SENSOR_TYPES[sensor_type][0]
         self.ccs811_client = ccs811_client
         self.type = sensor_type
         self._state = None
         self._unit_of_measurement = SENSOR_TYPES[sensor_type][1]
+        
+    async def async_added_to_hass(self):
+        """Run when entity about to be added."""
+        await super().async_added_to_hass()
+
+        # Add listener
+        async_track_state_change(
+            self.hass, self.temperature_sensor_entity_id, self._async_temperature_sensor_changed
+        )
+        async_track_state_change(
+            self.hass, self.humidity_sensor_entity_id, self._async_humidity_sensor_changed
+        )
+
+        @callback
+        def _async_startup(event):
+            """Init on startup."""
+            sensor_state_temperature = self.hass.states.get(self.temperature_sensor_entity_id)
+            if sensor_state_temperature and sensor_state_temperature.state != STATE_UNKNOWN:
+                self._async_update_temperature(sensor_state_temperature)
+
+            sensor_state_humidity = self.hass.states.get(self.humidity_sensor_entity_id)
+            if sensor_state_humidity and sensor_state_humidity.state != STATE_UNKNOWN:
+                self._async_update_humidity(sensor_state_humidity)
+
+        self.hass.bus.async_listen_once(EVENT_HOMEASSISTANT_START, _async_startup)
+
+
+    async def _async_temperature_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle temperature changes."""
+        if new_state is None:
+            return
+
+        self._async_update_temperature(new_state)
+
+    @callback
+    def _async_update_temperature(self, state):
+        """Update thermostat with latest state from sensor."""
+        try:
+            self.ccs811_client.set_temperature(float(state.state))
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from sensor: %s", ex)
+
+    async def _async_humidity_sensor_changed(self, entity_id, old_state, new_state):
+        """Handle humidity changes."""
+        if new_state is None:
+            return
+
+        self._async_update_humidity(new_state)
+
+    @callback
+    def _async_update_humidity(self, state):
+        """Update thermostat with latest state from sensor."""
+        try:
+            self.ccs811_client.set_humidity(float(state.state))
+        except ValueError as ex:
+            _LOGGER.error("Unable to update from sensor: %s", ex)
 
     @property
     def name(self):
@@ -134,5 +211,4 @@ class CCS811Sensor(Entity):
             self._state = eco2
         elif self.type == SENSOR_TVOC:
             self._state = self.ccs811_client.tvoc
-
 

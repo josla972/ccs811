@@ -107,7 +107,10 @@ class CCS811Handler:
         """Update temperature and humidity compensation and read sensor data."""
         if self.temperature != None and self.humidity != None:
             self.sensor.set_environmental_data(self.humidity, self.temperature)
-        self.eco2 = self.sensor.eco2
+#       Trim away error values.
+        new_eco2 = self.sensor.eco2
+        if new_eco2 < 65535:
+            self.eco2 = new_eco2
         self.tvoc = self.sensor.tvoc
 
     def set_temperature(self, temperature):
